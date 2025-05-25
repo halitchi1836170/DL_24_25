@@ -107,6 +107,108 @@ def dictToGraphObject(graph_dict):
     return Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=num_nodes, y=y)
 
 
+# ========================================================================================================================= #
+# ======================================================== CLASSES ======================================================== #
+# ========================================================================================================================= #
+
+
+class SymmetricCrossEntropy(torch.nn.Module):
+    def __init__(self, alpha=0.1, beta=1.0, num_classes=6):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.num_classes = num_classes
+
+    def forward(self, pred, labels):
+        # Standard Cross Entropy
+        ce = F.cross_entropy(pred, labels, reduction='none')
+
+        # Reverse Cross Entropy (RCE)
+        pred_softmax = F.softmax(pred, dim=1)
+        pred_softmax = torch.clamp(pred_softmax, min=1e-7, max=1.0)
+
+        # One-hot encoding delle labels
+        label_one_hot = torch.zeros(pred.size()).to(pred.device).scatter_(1, labels.view(-1, 1), 1)
+        label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0)
+
+        rce = (-1 * torch.sum(pred_softmax * torch.log(label_one_hot), dim=1))
+
+        # Symmetric loss
+        loss = self.alpha * ce + self.beta * rce
+        return loss.mean()
+
+class OutlierDiscountingLoss(torch.nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, pred, labels):
+        ce_loss = F.cross_entropy(pred, labels, reduction='none')
+        pt = torch.exp(-ce_loss)
+
+        # Focal loss component per down-weight outliers
+        focal_weight = self.alpha * (1 - pt) ** self.gamma
+
+        # Outlier detection: high loss samples are likely outliers
+        if len(ce_loss) > 1:
+            loss_threshold = torch.quantile(ce_loss, 0.7)  # Top 30% losses
+            outlier_mask = (ce_loss > loss_threshold).float()
+        else:
+            outlier_mask = torch.zeros_like(ce_loss)
+
+        # Discount outliers
+        discount_factor = 1.0 - 0.5 * outlier_mask
+
+        return (focal_weight * ce_loss * discount_factor).mean()
+
+class ELRLoss(torch.nn.Module):
+    def __init__(self, num_examp, num_classes=6, lambda_reg=3.0, beta=0.7):
+        super().__init__()
+        self.num_classes = num_classes
+        self.lambda_reg = lambda_reg
+        self.beta = beta
+        self.target = torch.zeros(num_examp, num_classes)
+
+    def forward(self, index, output, label):
+        y_pred = F.softmax(output, dim=1)
+        y_pred = torch.clamp(y_pred, 1e-4, 1.0 - 1e-4)
+
+        # Standard cross entropy
+        ce_loss = F.cross_entropy(output, label)
+
+        # ELR regularization
+        y_pred_avg = self.target[index].to(output.device)
+        elr_reg = ((1 - (y_pred_avg * y_pred).sum(dim=1)).log()).mean()
+
+        # Update target
+        self.target[index] = self.beta * self.target[index] + (1 - self.beta) * y_pred.detach().cpu()
+
+        return ce_loss + self.lambda_reg * elr_reg
+
+class CoTeaching:
+    def __init__(self, model1, model2, forget_rate=0.2):
+        self.model1 = model1
+        self.model2 = model2
+        self.forget_rate = forget_rate
+
+    def train_step(self, data, criterion):
+        # Entrambi i modelli predicono
+        out1 = self.model1(data)
+        out2 = self.model2(data)
+
+        # Calcola loss per entrambi
+        loss1 = F.cross_entropy(out1, data.y, reduction='none')
+        loss2 = F.cross_entropy(out2, data.y, reduction='none')
+
+        # Seleziona campioni con loss più bassa (clean samples)
+        num_remember = max(1, int((1 - self.forget_rate) * len(data.y)))
+        _, idx1 = torch.topk(loss1, num_remember, largest=False)
+        _, idx2 = torch.topk(loss2, num_remember, largest=False)
+
+        # Cross-training: model1 si allena sui campioni scelti da model2
+        return loss1[idx2].mean(), loss2[idx1].mean()
+
 
 # ========================================================================================================================= #
 # ======================================================== SET UPS ======================================================== #
@@ -127,22 +229,92 @@ stream.setFormatter(formatter)
 # ======================================================= CONSTANTS ======================================================= #
 # ========================================================================================================================= #
 
-num_epochs = 5
+num_epochs = 10
+mlp_ratio = 5
 patience = 15
-use_coteaching= True
-charsIntestazione = 150
+use_coteaching_FLAG= True
+chars_intestazione = 150
 input_dim = 300
-hidden_dim = 256
+hidden_dim = 258
 output_dim = 6
-num_layers = 5
-num_heads = 10
+num_layers = 1
+num_heads = 43                       # num_head * output_dim = hidden_dim !!!
 dropout = 0.1
+perc_train_set = 0.8
+batch_size=32
+alpha_SCE = 0.1
+beta_SCE = 1.0
+gamma_ODL = 2.0
+alpha_ODL = 0.25
+lambda_reg_ELR = 3.0
+forget_rate_co_teaching=0.2
+learning_rate = 0.001
 
 log = logging.getLogger('GCNL-Main')
 log.setLevel(LOG_LEVEL)
 log.addHandler(stream)
 
 
+# ========================================================================================================================= #
+# ===================================================== ARCHITECTURE ====================================================== #
+# ========================================================================================================================= #
+
+class GraphTransformerLayer(torch.nn.Module):
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1, mlp_ratio=4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.gat = GATConv(
+            hidden_dim,
+            hidden_dim // num_heads,
+            heads=num_heads,
+            dropout=dropout,
+            concat=True
+        )
+        self.norm1 = torch.nn.LayerNorm(hidden_dim)
+        self.norm2 = torch.nn.LayerNorm(hidden_dim)
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, mlp_hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(mlp_hidden_dim, hidden_dim),
+            torch.nn.Dropout(dropout)
+        )
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x, edge_index):
+        attn_out = self.gat(x, edge_index)
+        x = self.norm1(x + self.dropout(attn_out))
+        mlp_out = self.mlp(x)
+        x = self.norm2(x + mlp_out)
+        return x
+
+class GraphTransformer(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=5, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(1, hidden_dim)
+        # Stack di Transformer layers
+        self.layers = torch.nn.ModuleList([
+            GraphTransformerLayer(hidden_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        self.global_pool = global_mean_pool
+        self.output_proj = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim // 2, output_dim)
+        )
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.embedding(x)
+        for layer in self.layers:
+            x = layer(x, edge_index)
+        x = self.global_pool(x, batch)
+        out = self.output_proj(x)
+        return out
 
 # ========================================================================================================================= #
 # ======================================================= FUNCTIONS ======================================================= #
@@ -151,24 +323,209 @@ def add_zeros(data):
     data.x = torch.zeros(data.num_nodes, dtype=torch.long)
     return data
 
-
 def Intestazione(stringaTBP):
     strlenght = len(stringaTBP)
-    return ("="*int((charsIntestazione-strlenght)/2)+stringaTBP+"="*int((charsIntestazione-strlenght)/2))
+    return ("="*int((chars_intestazione-strlenght)/2)+stringaTBP+"="*int((chars_intestazione-strlenght)/2))
+
+def calculate_model_size(model: torch.nn.Module) -> int:
+    total_size = 0
+
+    for param in model.parameters():
+        param_size = param.numel() * 4
+        total_size += param_size
+
+    for buffer in model.buffers():
+        buffer_size = buffer.numel() * 4
+        total_size += buffer_size
+
+    return total_size
+
+def get_model_summary_simple(model: torch.nn.Module):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = calculate_model_size(model) / (1024 * 1024)
+
+    log.debug(f"Model: {model.__class__.__name__}")
+    log.debug(f"Total parameters: {total_params:,}")
+    log.debug(f"Trainable parameters: {trainable_params:,}")
+    log.debug(f"Model size: {model_size_mb:.2f} MB")
+
+def train_coteaching(coteacher, train_loader, optimizer1, optimizer2, device):
+    coteacher.model1.train()
+    coteacher.model2.train()
+    total_loss1 = 0
+    total_loss2 = 0
+
+    batch_pbar = tqdm(train_loader, desc="Co-Teaching", unit="batch")
+
+    for data in batch_pbar:
+        data = data.to(device)
+
+        optimizer1.zero_grad()
+        optimizer2.zero_grad()
+
+        loss1, loss2 = coteacher.train_step(data, F.cross_entropy)
+
+        loss1.backward()
+        loss2.backward()
+
+        torch.nn.utils.clip_grad_norm_(coteacher.model1.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(coteacher.model2.parameters(), 1.0)
+
+        optimizer1.step()
+        optimizer2.step()
+
+        total_loss1 += loss1.item()
+        total_loss2 += loss2.item()
+
+        batch_pbar.set_postfix({
+            'Loss1': f'{loss1.item():.4f}',
+            'Loss2': f'{loss2.item():.4f}'
+        })
+
+    return total_loss1 / len(train_loader), total_loss2 / len(train_loader)
+
+def evaluate(model, data_loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for data in data_loader:
+            data = data.to(device)
+            output = model(data)
+            pred = output.argmax(dim=1)
+            correct += (pred == data.y).sum().item()
+            total += data.y.size(0)
+
+    return correct / total if total > 0 else 0
 
 def main_training(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"Using device: {device}\n")
 
+    log.info(Intestazione("LOADING DATASET"))
     log.info("Loading test dataset...")
     test_dataset = GraphDataset(args.test_path, transform=add_zeros)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-    log.info("Done \n")
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    train_loader = None
+    val_loader = None
+
+    if args.train_path:
+        train_dataset = GraphDataset(args.train_path, transform=add_zeros)
+        train_size = int(perc_train_set * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_subset, val_subset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
+
+        log.info(f"Train size: {len(train_subset)}, Val size: {len(val_subset)}")
+
+    log.info("Dataset(s) loaded. \n")
+
+    log.info(Intestazione("WORK CONFIGURATIONS"))
+    log.info("Definition of work configuration...")
+
+    configs = []
+
+    loss_functions = {
+        'SCE': SymmetricCrossEntropy(alpha=alpha_SCE, beta=beta_SCE),
+        'ODL': OutlierDiscountingLoss(gamma=gamma_ODL, alpha=alpha_ODL),
+        'ELR': ELRLoss(len(train_subset), num_classes=output_dim,lambda_reg=lambda_reg_ELR) if train_loader else None
+    }
+
+    for loss_name, criterion in loss_functions.items():
+        if criterion is not None:
+            configs.append({
+                'name': f'{loss_name}',
+                'criterion': criterion,
+                'use_mixup': False,
+                'use_coteaching': use_coteaching_FLAG
+            })
+
+            # Aggiungi versione con mixup
+            configs.append({
+                'name': f'{loss_name}_mixup',
+                'criterion': criterion,
+                'use_mixup': True,
+                'use_coteaching': use_coteaching_FLAG
+            })
+
+
+    log.info("Configurations created: ")
+    counter = 1
+    for config in configs:
+        log.info("CONFIGURATION "+str(counter)+": " + config['name']+" - CoTeaching: "+str(config['use_coteaching']))
+        counter = counter + 1
+    log.info("Done. \n")
+
+    best_models = {}
+    best_accuracies = {}
+
+    #config_pbar = tqdm(configs, desc="Training Configurations")     #PER LE BARRE DI AVANZAMENTO
+    for config in configs:
+        log.info(Intestazione("STARTING TRAINING CONFIG: "+ config['name']+" - CoTeaching: "+str(config['use_coteaching'])))
+
+        config_name = config['name']
+
+        if not train_loader:
+            log.warning("No training data provided, skipping training configuration")
+            break
+
+        if config['use_coteaching']:
+            model1 = GraphTransformer(input_dim, hidden_dim, output_dim, num_layers, num_heads, dropout).to(device)
+            model2 = GraphTransformer(input_dim, hidden_dim, output_dim, num_layers, num_heads, dropout).to(device)
+
+            log.info(f"Created two graph transformer models: model1 and model2, printing info about model1:")
+            get_model_summary_simple(model1)
+
+            coteacher = CoTeaching(model1, model2, forget_rate=forget_rate_co_teaching)
+            optimizer1 = torch.optim.AdamW(model1.parameters(), lr=learning_rate, weight_decay=1e-4)
+            optimizer2 = torch.optim.AdamW(model2.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+            #epoch_pbar = tqdm(range(num_epochs), desc=f"{config_name} - Epochs", leave=False)
+
+            for epoch in range(num_epochs):
+                loss1, loss2 = train_coteaching(coteacher, train_loader, optimizer1, optimizer2, device)
+
+                # Valuta entrambi i modelli
+                val_acc1 = evaluate(model1, val_loader, device)
+                val_acc2 = evaluate(model2, val_loader, device)
+                val_acc = max(val_acc1, val_acc2)
+
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    # Salva il modello migliore
+                    best_model = model1 if val_acc1 > val_acc2 else model2
+                    best_models[config_name] = copy.deepcopy(best_model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                epoch_pbar.set_postfix({
+                    'Val Acc': f'{val_acc:.2f}%',
+                    'Patience': f'{patience_counter}/{args.patience}'
+                })
+
+                if patience_counter >= args.patience:
+                    break
+
+            best_accuracies[config_name] = best_acc
+
+            best_acc = 0
+            patience_counter = 0
+
+
+
+        log.info("Done, next configuration... \n\n")
+
 
     return "",""
 
 def main(args):
-    log.info(Intestazione("STARTING TRAINING"))
+    log.info(Intestazione("STARTING MAIN"))
     log.info("Starting training with Graph Transformer")
     log.info(f"Arguments: {vars(args)}\n")
 
