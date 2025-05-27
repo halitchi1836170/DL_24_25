@@ -15,6 +15,7 @@ from colorlog import ColoredFormatter
 from pathlib import Path
 from torch_geometric.data import Dataset, Data
 import pickle
+from datetime import datetime
 
 # ========================================================================================================================= #
 # ================================================ UNIONE FILE loadDATA =================================================== #
@@ -221,24 +222,25 @@ formatter = ColoredFormatter(LOGFORMAT)
 stream = logging.StreamHandler()
 stream.setLevel(LOG_LEVEL)
 stream.setFormatter(formatter)
-
-#logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f"training_log_{timestamp}.txt"
+streamFile = logging.FileHandler(filename=f'./logs/{log_filename}', mode='w', encoding='utf-8')
 
 
 # ========================================================================================================================= #
 # ======================================================= CONSTANTS ======================================================= #
 # ========================================================================================================================= #
 
-num_epochs = 10
-mlp_ratio = 5
+num_epochs = 25
+mlp_ratio = 4
 patience = 15
-use_coteaching_FLAG= True
+use_coteaching_FLAG= False
 chars_intestazione = 150
 input_dim = 300
-hidden_dim = 258
+hidden_dim = 250
 output_dim = 6
-num_layers = 1
-num_heads = 43                       # num_head * output_dim = hidden_dim !!!
+num_layers = 5
+num_heads = 5                       # num_head * output_dim = hidden_dim !!!
 dropout = 0.1
 perc_train_set = 0.8
 batch_size=32
@@ -249,18 +251,20 @@ alpha_ODL = 0.25
 lambda_reg_ELR = 3.0
 forget_rate_co_teaching=0.2
 learning_rate = 0.001
+save_checkpoint = True
+alpha_mixup=0.2
 
 log = logging.getLogger('GCNL-Main')
 log.setLevel(LOG_LEVEL)
 log.addHandler(stream)
-
+log.addHandler(streamFile)
 
 # ========================================================================================================================= #
 # ===================================================== ARCHITECTURE ====================================================== #
 # ========================================================================================================================= #
 
 class GraphTransformerLayer(torch.nn.Module):
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.1, mlp_ratio=4):
+    def __init__(self, hidden_dim, num_heads, dropout, mlp_ratio):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -291,12 +295,12 @@ class GraphTransformerLayer(torch.nn.Module):
         return x
 
 class GraphTransformer(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=5, num_heads=8, dropout=0.1):
+    def __init__(self, input_dim, hidden_dim, output_dim, mlp_ratio, num_layers ,num_heads, dropout):
         super().__init__()
         self.embedding = torch.nn.Embedding(1, hidden_dim)
         # Stack di Transformer layers
         self.layers = torch.nn.ModuleList([
-            GraphTransformerLayer(hidden_dim, num_heads, dropout)
+            GraphTransformerLayer(hidden_dim, num_heads, dropout, mlp_ratio)
             for _ in range(num_layers)
         ])
         self.global_pool = global_mean_pool
@@ -350,21 +354,31 @@ def get_model_summary_simple(model: torch.nn.Module):
     log.debug(f"Trainable parameters: {trainable_params:,}")
     log.debug(f"Model size: {model_size_mb:.2f} MB")
 
-def train_coteaching(coteacher, train_loader, optimizer1, optimizer2, device):
+def train_coteaching(coteacher, train_loader, optimizer1, optimizer2, device, criterion,config_name,epoch, num_epochs):
     coteacher.model1.train()
     coteacher.model2.train()
     total_loss1 = 0
     total_loss2 = 0
 
-    batch_pbar = tqdm(train_loader, desc="Co-Teaching", unit="batch")
+    batch_pbar = tqdm(train_loader, desc=f"Co-Teaching Training | {config_name} | Epoch {epoch+1}/{num_epochs}",unit="batch")
 
-    for data in batch_pbar:
+    for batch_idx,data in enumerate(batch_pbar):
         data = data.to(device)
 
         optimizer1.zero_grad()
         optimizer2.zero_grad()
 
-        loss1, loss2 = coteacher.train_step(data, F.cross_entropy)
+        out1 = coteacher.model1(data)
+        out2 = coteacher.model1(data)
+
+        if isinstance(criterion, ELRLoss):
+            indices = torch.arange(batch_idx * train_loader.batch_size,
+                                   min((batch_idx + 1) * train_loader.batch_size, len(train_loader.dataset)))
+            loss1 = criterion(indices, out1, data.y)
+            loss2 = criterion(indices, out2, data.y)
+        else:
+            loss1 = criterion(out1, data.y)
+            loss2 = criterion(out2, data.y)
 
         loss1.backward()
         loss2.backward()
@@ -399,6 +413,117 @@ def evaluate(model, data_loader, device):
             total += data.y.size(0)
 
     return correct / total if total > 0 else 0
+
+def graph_mixup(data1, data2, alpha=0.2, num_classes=6):
+    lam = np.random.beta(alpha, alpha)
+
+    # Mix node features (stesso numero di nodi required)
+    if data1.x.shape[0] == data2.x.shape[0]:
+        mixed_x = lam * data1.x + (1 - lam) * data2.x
+
+        # Mix labels
+        y1_one_hot = F.one_hot(data1.y, num_classes).float()
+        y2_one_hot = F.one_hot(data2.y, num_classes).float()
+        mixed_y = lam * y1_one_hot + (1 - lam) * y2_one_hot
+
+        # Create mixed data object
+        mixed_data = data1.clone()
+        mixed_data.x = mixed_x
+
+        return mixed_data, mixed_y, lam
+    else:
+        # Se i grafi hanno dimensioni diverse, restituisci il primo senza mixup
+        return data1, F.one_hot(data1.y, num_classes).float(), 1.0
+
+def train_single_model(model, train_loader, criterion, optimizer, device, config_name, epoch, num_epochs, use_mixup,alpha_mixup,save_checkpoint):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    batch_pbar = tqdm(train_loader, desc=f"Single Training | {config_name} | Epoch {epoch + 1}/{num_epochs}", unit="batch")
+
+    for batch_idx, data in enumerate(batch_pbar):
+        data = data.to(device)
+        optimizer.zero_grad()
+
+        if use_mixup and len(train_loader.dataset) > batch_idx + 1:
+            # Get another random sample for mixup
+            next_idx = (batch_idx + 1) % len(train_loader)
+            try:
+                data2 = next(iter(DataLoader([train_loader.dataset[next_idx]], batch_size=1)))
+                data2 = data2.to(device)
+
+                mixed_data, mixed_y, lam = graph_mixup(data, data2, alpha_mixup, output_dim)
+                output = model(mixed_data)
+
+                # Mixup loss
+                loss = lam * F.cross_entropy(output, mixed_y.argmax(dim=1)) + \
+                       (1 - lam) * F.cross_entropy(output, data2.y)
+            except:
+                # Fallback to normal training if mixup fails
+                output = model(data)
+                if isinstance(criterion, ELRLoss):
+                    indices = torch.arange(batch_idx * train_loader.batch_size, min((batch_idx + 1) * train_loader.batch_size, len(train_loader.dataset)))
+                    loss = criterion(indices, output, data.y)
+                else:
+                    loss = criterion(output, data.y)
+        else:
+            output = model(data)
+            if isinstance(criterion, ELRLoss):
+                indices = torch.arange(batch_idx * train_loader.batch_size, min((batch_idx + 1) * train_loader.batch_size, len(train_loader.dataset)))
+                loss = criterion(indices, output, data.y)
+            else:
+                loss = criterion(output, data.y)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        if not use_mixup:  # Solo per accuracy normale
+            pred = output.argmax(dim=1)
+            correct += (pred == data.y).sum().item()
+            total += data.y.size(0)
+
+        # Aggiorna progress bar
+        if use_mixup:
+            batch_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+        else:
+            batch_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{100. * correct / total:.2f}%' if total > 0 else '0.00%'
+            })
+
+    if save_checkpoint:
+        checkpoint_path = os.path.join(os.getcwd(), 'checkpoints', f"model_{os.path.basename(os.path.dirname(args.test_path))}_best")
+        checkpoints_folder = os.path.join(os.getcwd(), 'checkpoints',os.path.basename(os.path.dirname(args.test_path)))
+        os.makedirs(checkpoints_folder, exist_ok=True)
+
+        checkpoint_file = f"{checkpoint_path}_epoch_{epoch + 1}.pth"
+        torch.save(model.state_dict(), checkpoint_file)
+        print(f"Checkpoint saved at {checkpoint_file}")
+
+    return total_loss / len(train_loader)
+
+def evaluate_predictions(model, data_loader, device):
+    model.eval()
+    predictions = []
+
+    with torch.no_grad():
+        for data in data_loader:
+            data = data.to(device)
+            output = model(data)
+            pred = output.argmax(dim=1)
+            predictions.extend(pred.cpu().numpy())
+
+    return predictions
+
+
+
+
+
+
 
 def main_training(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -436,6 +561,10 @@ def main_training(args):
         'ELR': ELRLoss(len(train_subset), num_classes=output_dim,lambda_reg=lambda_reg_ELR) if train_loader else None
     }
 
+    loss_functions = {
+        'SCE': SymmetricCrossEntropy(alpha=alpha_SCE, beta=beta_SCE)
+    }
+
     for loss_name, criterion in loss_functions.items():
         if criterion is not None:
             configs.append({
@@ -444,7 +573,6 @@ def main_training(args):
                 'use_mixup': False,
                 'use_coteaching': use_coteaching_FLAG
             })
-
             # Aggiungi versione con mixup
             configs.append({
                 'name': f'{loss_name}_mixup',
@@ -469,26 +597,25 @@ def main_training(args):
         log.info(Intestazione("STARTING TRAINING CONFIG: "+ config['name']+" - CoTeaching: "+str(config['use_coteaching'])))
 
         config_name = config['name']
+        criterion_iter = config['criterion']
 
         if not train_loader:
             log.warning("No training data provided, skipping training configuration")
             break
 
         if config['use_coteaching']:
-            model1 = GraphTransformer(input_dim, hidden_dim, output_dim, num_layers, num_heads, dropout).to(device)
-            model2 = GraphTransformer(input_dim, hidden_dim, output_dim, num_layers, num_heads, dropout).to(device)
+            model1 = GraphTransformer(input_dim, hidden_dim, output_dim, mlp_ratio, num_layers, num_heads, dropout).to(device)
+            model2 = GraphTransformer(input_dim, hidden_dim, output_dim, mlp_ratio, num_layers, num_heads, dropout).to(device)
 
-            log.info(f"Created two graph transformer models: model1 and model2, printing info about model1:")
+            log.info(f"Created two graph transformer models: model1 and model2, printing info about model1...")
             get_model_summary_simple(model1)
 
             coteacher = CoTeaching(model1, model2, forget_rate=forget_rate_co_teaching)
             optimizer1 = torch.optim.AdamW(model1.parameters(), lr=learning_rate, weight_decay=1e-4)
             optimizer2 = torch.optim.AdamW(model2.parameters(), lr=learning_rate, weight_decay=1e-4)
 
-            #epoch_pbar = tqdm(range(num_epochs), desc=f"{config_name} - Epochs", leave=False)
-
             for epoch in range(num_epochs):
-                loss1, loss2 = train_coteaching(coteacher, train_loader, optimizer1, optimizer2, device)
+                loss1, loss2 = train_coteaching(coteacher, train_loader, optimizer1, optimizer2, device, criterion_iter,config_name ,epoch, num_epochs)
 
                 # Valuta entrambi i modelli
                 val_acc1 = evaluate(model1, val_loader, device)
@@ -504,25 +631,82 @@ def main_training(args):
                 else:
                     patience_counter += 1
 
-                epoch_pbar.set_postfix({
-                    'Val Acc': f'{val_acc:.2f}%',
-                    'Patience': f'{patience_counter}/{args.patience}'
-                })
-
-                if patience_counter >= args.patience:
+                if patience_counter >= patience:
                     break
 
-            best_accuracies[config_name] = best_acc
+        else:
+            # Training normale
+            model = GraphTransformer(input_dim, hidden_dim, output_dim, mlp_ratio, num_layers, num_heads, dropout).to(device)
+
+            log.info(f"Created graph transformer with criterion : {config['name']}, printing info about model...")
+            get_model_summary_simple(model)
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
             best_acc = 0
             patience_counter = 0
 
 
+            for epoch in range(num_epochs):
+                train_loss = train_single_model(model, train_loader, config['criterion'], optimizer, device, config_name, epoch, num_epochs,config['use_mixup'],alpha_mixup,save_checkpoint)
 
+                val_acc = evaluate(model, val_loader, device)
+                scheduler.step()
+
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    best_models[config_name] = copy.deepcopy(model.state_dict())
+                    best_accuracies[config_name] = best_acc
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    break
+
+        log.info(f"Best accuracy for {config_name}: {best_acc:.4f}")
+
+        # Aggiorna progress bar principale
+        current_best = max(best_accuracies.values())
+        log.info({'Current Best': f'{current_best*100:.2f}%'})
         log.info("Done, next configuration... \n\n")
 
+    # Trova il modello migliore
+    if best_accuracies:
+        best_config = max(best_accuracies, key=best_accuracies.get)
+        log.info(f"Best overall configuration: {best_config} with accuracy: {best_accuracies[best_config]:.4f}")
 
-    return "",""
+        # Carica il modello migliore per le predizioni finali
+        final_model = GraphTransformer(input_dim, hidden_dim, output_dim, num_layers, num_heads, dropout).to(device)
+        final_model.load_state_dict(best_models[best_config])
+    else:
+        # Se non c'è training, usa un modello base per le predizioni
+        final_model = GraphTransformer(input_dim, hidden_dim, output_dim, num_layers, num_heads, dropout).to(device)
+        log.info("No training performed, using untrained model for predictions")
+
+    # Genera predizioni sul test set
+    log.info("Generating test predictions...")
+    predictions = evaluate_predictions(final_model, test_loader, device)
+    test_graph_ids = list(range(len(predictions)))
+
+    # Salva le predizioni
+    test_dir_name = os.path.dirname(args.test_path).split(os.sep)[-1]
+    output_csv_path = f"testset_{test_dir_name}.csv"
+    output_df = pd.DataFrame({
+        "GraphID": test_graph_ids,
+        "Class": predictions
+    })
+    output_df.to_csv(output_csv_path, index=False)
+    log.info(f"Test predictions saved to {output_csv_path}")
+
+    # Salva il modello migliore
+    if best_accuracies:
+        model_path = f"best_model_{best_config}.pth"
+        torch.save(best_models[best_config], model_path)
+        log.info(f"Best model saved to {model_path}")
+
+    return best_models, best_accuracies
 
 def main(args):
     log.info(Intestazione("STARTING MAIN"))
