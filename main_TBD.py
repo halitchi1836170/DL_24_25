@@ -944,7 +944,7 @@ try:
                                                                       criterion,
                                                                       calculate_accuracy=True, )
 
-                    log.info("-------RECAP-------")
+                    log.info("--------RECAP--------")
                     log.info(f"Epoch {epoch + 1}/{num_epochs}")
                     log.info(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
                     log.info(
